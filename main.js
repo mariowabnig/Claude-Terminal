@@ -112,6 +112,15 @@ if __name__ == '__main__':
     main()
 `;
 
+function getSessionStatus(session) {
+    const proc = session.process;
+    if (!proc || proc.killed || session.exited) return 'done';
+    if (session.isWorking) return 'working';
+    if (session.userInteracted) return 'active';
+    if (session.hasWorked) return 'paused';
+    return 'idle';
+}
+
 // File extensions we support (basically: text files you'd want Claude to work on)
 const SUPPORTED_EXTENSIONS = new Set([
     'tex', 'md', 'js', 'ts', 'jsx', 'tsx', 'css', 'scss', 'html',
@@ -264,13 +273,8 @@ class ClaudeTerminalView extends ItemView {
         // Check for existing session
         let session = this.plugin.sessions.get(fileKey);
 
-        if (session && session.process && (session.exited || session.process.killed)) {
-            // Dead session — reattach terminal to show history + green status
-            clearTimeout(session._autoCloseTimer);
-            this._attachTerminal(session);
-            this._updateStatusDot(session);
-        } else if (session && session.process && !session.process.killed) {
-            // Live session — reattach, cancel auto-close since user came back
+        if (session && session.process) {
+            // Reattach existing session (live or dead) — cancel auto-close
             clearTimeout(session._autoCloseTimer);
             this._attachTerminal(session);
             this._updateStatusDot(session);
@@ -280,8 +284,7 @@ class ClaudeTerminalView extends ItemView {
                 this.plugin.sessions.set(fileKey, session);
                 this._attachTerminal(session);
                 this.plugin._updateFileTreeBadges();
-                setTimeout(() => this.plugin._updateFileTreeBadges(), 1000);
-                setTimeout(() => this.plugin._updateFileTreeBadges(), 3000);
+                setTimeout(() => this.plugin._updateFileTreeBadges(), 500);
             }
         }
     }
@@ -325,14 +328,15 @@ class ClaudeTerminalView extends ItemView {
             const XTerm = this._xtermModule.Terminal;
             const FitAddon = this._fitModule.FitAddon;
 
+            const cs = getComputedStyle(document.body);
             const terminal = new XTerm({
                 cursorBlink: true,
                 fontSize: 13,
                 fontFamily: 'Menlo, Monaco, "Courier New", monospace',
                 theme: {
-                    background: getComputedStyle(document.body).getPropertyValue('--background-primary').trim() || '#1e1e1e',
-                    foreground: getComputedStyle(document.body).getPropertyValue('--text-normal').trim() || '#d4d4d4',
-                    cursor: getComputedStyle(document.body).getPropertyValue('--interactive-accent').trim() || '#528bff',
+                    background: cs.getPropertyValue('--background-primary').trim() || '#1e1e1e',
+                    foreground: cs.getPropertyValue('--text-normal').trim() || '#d4d4d4',
+                    cursor: cs.getPropertyValue('--interactive-accent').trim() || '#528bff',
                 },
                 scrollback: 10000,
                 convertEol: true,
@@ -414,20 +418,10 @@ class ClaudeTerminalView extends ItemView {
         if (!this.statusDot) return;
         if (session.key !== this.currentFileKey) return;
 
-        const proc = session.process;
-        if (!proc || proc.killed || session.exited) {
-            this.statusDot.className = 'claude-term-status-dot done';
-            this.statusDot.title = 'Session finished';
-        } else if (session.isWorking) {
-            this.statusDot.className = 'claude-term-status-dot working';
-            this.statusDot.title = 'Working...';
-        } else if (session.hasWorked) {
-            this.statusDot.className = 'claude-term-status-dot paused';
-            this.statusDot.title = 'Waiting for input';
-        } else {
-            this.statusDot.className = 'claude-term-status-dot idle';
-            this.statusDot.title = 'No activity yet';
-        }
+        const status = getSessionStatus(session);
+        const titles = { done: 'Session finished', working: 'Working...', paused: 'Waiting for input', active: 'Active', idle: 'No activity yet' };
+        this.statusDot.className = `claude-term-status-dot ${status}`;
+        this.statusDot.title = titles[status] || '';
     }
 
     async _createSession(fileKey, absPath, file) {
@@ -523,12 +517,9 @@ class ClaudeTerminalView extends ItemView {
         let initialPrompt;
 
         if (ext === 'tex') {
-            // LaTeX worksheet — use school context
             const classMatch = fileName.match(/-(\d\w)\./i);
             const className = classMatch ? classMatch[1].toUpperCase() : '';
             initialPrompt = `We are working on "${fileKey}"${className ? ` for class ${className}` : ''}. Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: `;
-        } else if (ext === 'md') {
-            initialPrompt = `We are working on the file "${fileKey}". Read it first, then help me with the following: `;
         } else {
             initialPrompt = `We are working on the file "${fileKey}". Read it first, then help me with the following: `;
         }
@@ -700,6 +691,7 @@ class ClaudeTerminalPlugin extends Plugin {
         // --- File tree badge observer ---
         this._badgeDebounce = null;
         this._fileTreeObserver = new MutationObserver(() => {
+            if (this.sessions.size === 0) return;
             clearTimeout(this._badgeDebounce);
             this._badgeDebounce = setTimeout(() => this._updateFileTreeBadges(), 150);
         });
@@ -820,8 +812,9 @@ class ClaudeTerminalPlugin extends Plugin {
         if (fileKey === this._currentFileKey) return;
         this._currentFileKey = fileKey;
 
-        // If the terminal sidebar is open, switch its session
+        // Only auto-switch if the sidebar is already open (or autoOpen is enabled)
         const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+        if (termLeaves.length === 0 && !this.settings.autoOpen) return;
         if (termLeaves.length > 0) {
             const view = termLeaves[0].view;
             if (view instanceof ClaudeTerminalView) {
@@ -922,18 +915,7 @@ class ClaudeTerminalPlugin extends Plugin {
     _getSessionFilePaths() {
         const map = new Map();
         for (const [fileKey, session] of this.sessions) {
-            const proc = session.process;
-            let status;
-            if (!proc || proc.killed || session.exited) {
-                status = 'done';
-            } else if (session.isWorking) {
-                status = 'working';
-            } else if (session.hasWorked) {
-                status = 'done';
-            } else {
-                status = 'idle';
-            }
-            map.set(fileKey, status);
+            map.set(fileKey, getSessionStatus(session));
         }
         return map;
     }
@@ -1004,22 +986,10 @@ class SessionPickerModal extends FuzzySuggestModal {
     getItems() {
         const items = [];
         for (const [fileKey, session] of this.plugin.sessions) {
-            const proc = session.process;
-            let status;
-            if (!proc || proc.killed || session.exited) {
-                status = 'done';
-            } else if (session.isWorking) {
-                status = 'working';
-            } else if (session.userInteracted) {
-                status = 'active';
-            } else {
-                status = 'idle';
-            }
-            items.push({ fileKey, session, status });
+            items.push({ fileKey, session, status: getSessionStatus(session) });
         }
-        // Sort: working first, then active, then idle, then done
-        const order = { working: 0, active: 1, idle: 2, done: 3 };
-        items.sort((a, b) => order[a.status] - order[b.status]);
+        const order = { working: 0, active: 1, paused: 1, idle: 2, done: 3 };
+        items.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
         return items;
     }
 
