@@ -92,6 +92,17 @@ This is a local plugin.
 2. In Obsidian: **Settings → Community plugins** → disable Restricted mode → find **Claude Terminal** in the list → enable it.
 3. To reload after updates: disable and re-enable, or use **Reload app without saving**.
 
+## Changelog
+
+### 2026-03-29 — Code review: bug fixes and simplification
+
+- **Fix: dead `md` branch** — the markdown-specific initial prompt was identical to the generic fallback; removed the redundant branch.
+- **Fix: badge status bug** — sessions with `hasWorked=true` were incorrectly shown as "done" (green checkmark) in file tree badges while still running. Now correctly shown as "paused".
+- **Fix: `autoOpen` setting ignored** — the setting existed but was never read; sidebar always auto-opened. Now respects the setting: when disabled, the sidebar only switches sessions if already open.
+- **Simplify: consolidate `switchSession` branches** — two identical `if/else if` branches (dead session vs live session) unified into one.
+- **Simplify: extract `getSessionStatus()` helper** — session status derivation was duplicated in 3 places; now a single shared function.
+- **Performance: reduce triple badge update to single deferred call**, guard MutationObserver when no sessions exist, single `getComputedStyle` call for xterm theme.
+
 ## Technical notes
 
 - Terminal: xterm.js (bundled) with FitAddon for auto-sizing.
