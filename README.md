@@ -74,6 +74,13 @@ To avoid accumulating idle Claude processes when browsing through files, session
 |---------|---------|-------------|
 | Auto-open for supported files | On | Automatically open the sidebar when viewing a supported file |
 | Notify on session exit | On | Show a notification when a Claude session process exits |
+| Claude binary path | *(auto-detect)* | Path to the Claude Code binary. Leave empty for `~/.local/bin/claude` |
+| Python3 path | *(auto-detect)* | Path to Python 3 binary. Leave empty to search common locations |
+| Extra PATH directories | *(empty)* | Comma-separated extra directories added to PATH when spawning Claude |
+| Skip permission prompts | On | Pass `--dangerously-skip-permissions` to Claude Code |
+| Terminal font size | 13 | xterm terminal font size |
+| Terminal scrollback lines | 10000 | Lines kept in terminal scrollback buffer |
+| Idle session timeout | 60 | Seconds before unused sessions are auto-closed (0 = never) |
 
 ## Relationship to PDF Fit Viewer
 
@@ -94,20 +101,36 @@ This is a local plugin.
 
 ## Changelog
 
-### 2026-03-29 — Code review: bug fixes and simplification
+### 2026-03-29 — Code review: bug fixes, customization, and simplification
 
-- **Fix: dead `md` branch** — the markdown-specific initial prompt was identical to the generic fallback; removed the redundant branch.
-- **Fix: badge status bug** — sessions with `hasWorked=true` were incorrectly shown as "done" (green checkmark) in file tree badges while still running. Now correctly shown as "paused".
-- **Fix: `autoOpen` setting ignored** — the setting existed but was never read; sidebar always auto-opened. Now respects the setting: when disabled, the sidebar only switches sessions if already open.
-- **Simplify: consolidate `switchSession` branches** — two identical `if/else if` branches (dead session vs live session) unified into one.
-- **Simplify: extract `getSessionStatus()` helper** — session status derivation was duplicated in 3 places; now a single shared function.
-- **Performance: reduce triple badge update to single deferred call**, guard MutationObserver when no sessions exist, single `getComputedStyle` call for xterm theme.
+**Bug fixes:**
+- **Fix: dead `md` branch** — the markdown-specific initial prompt was identical to the generic fallback; removed.
+- **Fix: badge status bug** — sessions with `hasWorked=true` were incorrectly shown as "done" in file tree badges while still running. Now correctly shown as "paused".
+- **Fix: `autoOpen` setting ignored** — the setting existed but was never read. Now respects the setting.
+
+**New settings:**
+- **Claude binary path** — custom path to the Claude Code binary (default: auto-detect `~/.local/bin/claude`)
+- **Python3 path** — custom path to Python 3 (default: auto-detect common locations)
+- **Extra PATH directories** — comma-separated list of additional PATH entries for Claude's environment
+- **Skip permission prompts** — toggle `--dangerously-skip-permissions` flag (default: on)
+- **Terminal font size** — xterm font size (default: 13)
+- **Terminal scrollback lines** — scrollback buffer size (default: 10,000)
+- **Idle session timeout** — seconds before unused sessions are auto-closed (default: 60, set 0 to disable)
+
+**Architecture:**
+- **PTY bridge extracted to `pty-bridge.py`** — standalone file loaded at runtime instead of embedded string.
+- **stdout/stderr listeners moved to `_createSession`** — prevents double-output on reattach.
+
+**Simplification:**
+- Consolidate identical `switchSession` branches, extract `getSessionStatus()` helper.
+- Reduce triple badge update to single deferred call, guard observers when no sessions.
+- Sync script auto-detects vault direction (iCloud ↔ OneDrive).
 
 ## Technical notes
 
 - Terminal: xterm.js (bundled) with FitAddon for auto-sizing.
-- PTY: Python 3 bridge script that creates a real PTY pair using `pty.openpty()`, provides full TTY support.
-- Process: `~/.local/bin/claude --dangerously-skip-permissions` running in the vault root.
-- PATH augmented with TinyTeX, Homebrew, MacTeX, and `~/.local/bin`.
+- PTY: `pty-bridge.py` — Python 3 script that creates a real PTY pair using `pty.openpty()`, provides full TTY support.
+- Process: Claude Code binary (configurable) running in the vault root.
+- PATH augmented with TinyTeX, Homebrew, MacTeX, `~/.local/bin`, and user-configured extra directories.
 - Resize: `ResizeObserver` on the terminal container → `FitAddon.fit()` → resize command via fd 3 pipe → `SIGWINCH` to the child process.
 - File tree badges: `MutationObserver` on file tree containers, re-applied on DOM changes (debounced 150ms).

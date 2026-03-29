@@ -14,103 +14,7 @@ const { spawn } = require('child_process');
 // ---------------------------------------------------------------------------
 const VIEW_TYPE = 'claude-terminal-view';
 
-// Python PTY bridge script — spawns a shell command inside a real PTY
-// so Claude Code gets full TTY support (colors, interactive mode, etc.)
-const PTY_BRIDGE_SCRIPT = `
-import sys, os, select, struct, fcntl, termios, pty, signal
-
-def main():
-    cmd = sys.argv[1:]
-    if not cmd:
-        sys.exit(1)
-
-    # Create a PTY pair
-    master_fd, slave_fd = pty.openpty()
-
-    # Spawn the child process in the slave PTY
-    pid = os.fork()
-    if pid == 0:
-        # Child process
-        os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-        os.dup2(slave_fd, 0)
-        os.dup2(slave_fd, 1)
-        os.dup2(slave_fd, 2)
-        os.close(master_fd)
-        os.close(slave_fd)
-        os.execvp(cmd[0], cmd)
-
-    # Parent process
-    os.close(slave_fd)
-
-    def handle_resize(cols, rows):
-        try:
-            s = struct.pack('HHHH', rows, cols, 0, 0)
-            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
-            os.kill(pid, signal.SIGWINCH)
-        except:
-            pass
-
-    import threading
-
-    def read_stdin():
-        while True:
-            try:
-                data = os.read(0, 4096)
-                if not data:
-                    break
-                os.write(master_fd, data)
-            except OSError:
-                break
-
-    stdin_thread = threading.Thread(target=read_stdin, daemon=True)
-    stdin_thread.start()
-
-    # Read fd 3 (resize channel) if available
-    resize_fd = None
-    try:
-        resize_fd = 3
-        os.fstat(resize_fd)
-        def read_resize():
-            buf = b''
-            while True:
-                try:
-                    data = os.read(resize_fd, 1024)
-                    if not data:
-                        break
-                    buf += data
-                    while b'\\n' in buf:
-                        line, buf = buf.split(b'\\n', 1)
-                        parts = line.decode().strip().split(',')
-                        if len(parts) == 2:
-                            handle_resize(int(parts[0]), int(parts[1]))
-                except OSError:
-                    break
-        resize_thread = threading.Thread(target=read_resize, daemon=True)
-        resize_thread.start()
-    except:
-        pass
-
-    # Read master and write to stdout
-    while True:
-        try:
-            data = os.read(master_fd, 4096)
-            if not data:
-                break
-            os.write(1, data)
-            sys.stdout.flush()
-        except OSError:
-            break
-
-    # Wait for child
-    try:
-        _, status = os.waitpid(pid, 0)
-    except:
-        pass
-
-if __name__ == '__main__':
-    main()
-`;
+// PTY bridge is loaded from pty-bridge.py at runtime (see _createSession)
 
 function getSessionStatus(session) {
     const proc = session.process;
@@ -255,10 +159,11 @@ class ClaudeTerminalView extends ItemView {
 
         // Start auto-close timer on the session we're leaving
         const leavingSession = this.currentFileKey ? this.plugin.sessions.get(this.currentFileKey) : null;
-        if (leavingSession && !leavingSession.userInteracted && !leavingSession.exited) {
+        const timeout = (this.plugin.settings.idleSessionTimeout || 0) * 1000;
+        if (leavingSession && !leavingSession.userInteracted && !leavingSession.exited && timeout > 0) {
             leavingSession._autoCloseTimer = setTimeout(() => {
                 this.plugin._autoCloseSession(leavingSession);
-            }, 60000);
+            }, timeout);
         }
 
         this._detachCurrentTerminal();
@@ -329,16 +234,17 @@ class ClaudeTerminalView extends ItemView {
             const FitAddon = this._fitModule.FitAddon;
 
             const cs = getComputedStyle(document.body);
+            const settings = this.plugin.settings;
             const terminal = new XTerm({
                 cursorBlink: true,
-                fontSize: 13,
+                fontSize: settings.terminalFontSize || 13,
                 fontFamily: 'Menlo, Monaco, "Courier New", monospace',
                 theme: {
                     background: cs.getPropertyValue('--background-primary').trim() || '#1e1e1e',
                     foreground: cs.getPropertyValue('--text-normal').trim() || '#d4d4d4',
                     cursor: cs.getPropertyValue('--interactive-accent').trim() || '#528bff',
                 },
-                scrollback: 10000,
+                scrollback: settings.terminalScrollback || 10000,
                 convertEol: true,
             });
 
@@ -366,33 +272,8 @@ class ClaudeTerminalView extends ItemView {
                 }
             });
 
-            // Wire PTY output to terminal
-            if (session.process && session.process.stdout) {
-                session.process.stdout.on('data', (data) => {
-                    if (session.terminal) {
-                        session.terminal.write(data);
-                    }
-                    session.lastActivity = Date.now();
-                    session.hasWorked = true;
-                    if (!session.isWorking) {
-                        session.isWorking = true;
-                        this._updateStatusDot(session);
-                        this.plugin._updateFileTreeBadges();
-                    }
-                    clearTimeout(session._idleTimer);
-                    session._idleTimer = setTimeout(() => {
-                        session.isWorking = false;
-                        this._updateStatusDot(session);
-                        this.plugin._updateFileTreeBadges();
-                    }, 3000);
-                });
-                session.process.stderr.on('data', (data) => {
-                    if (session.terminal) {
-                        session.terminal.write(data);
-                    }
-                    session.lastActivity = Date.now();
-                });
-            }
+            // stdout/stderr listeners are registered once in _createSession,
+            // writing to session.terminal (which always points to the current terminal).
         }
 
         // ResizeObserver to auto-fit terminal
@@ -425,25 +306,34 @@ class ClaudeTerminalView extends ItemView {
     }
 
     async _createSession(fileKey, absPath, file) {
+        const settings = this.plugin.settings;
         const homeDir = require('os').homedir();
-        const claudePath = path.join(homeDir, '.local/bin/claude');
+
+        // Resolve Claude binary path
+        const claudePath = settings.claudeBinaryPath || path.join(homeDir, '.local/bin/claude');
         if (!fs.existsSync(claudePath)) {
-            new Notice('Claude Code not found at ~/.local/bin/claude');
+            new Notice(`Claude Code not found at ${claudePath}. Check plugin settings.`);
             return null;
         }
 
-        // Find Python3
-        const pythonCandidates = [
-            '/opt/homebrew/bin/python3',
-            '/usr/local/bin/python3',
-            '/usr/bin/python3',
-        ];
-        let pythonPath = null;
-        for (const p of pythonCandidates) {
-            if (fs.existsSync(p)) { pythonPath = p; break; }
+        // Resolve Python3 path
+        let pythonPath = settings.pythonPath || null;
+        if (!pythonPath) {
+            for (const p of ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']) {
+                if (fs.existsSync(p)) { pythonPath = p; break; }
+            }
         }
         if (!pythonPath) {
-            new Notice('Python3 not found — needed for terminal PTY');
+            new Notice('Python3 not found — needed for terminal PTY. Set path in plugin settings.');
+            return null;
+        }
+
+        // Load PTY bridge script from plugin folder
+        const pluginDir = this.plugin.manifest.dir;
+        const basePath = this.plugin.app.vault.adapter.basePath;
+        const ptyBridgePath = path.join(basePath, pluginDir, 'pty-bridge.py');
+        if (!fs.existsSync(ptyBridgePath)) {
+            new Notice('pty-bridge.py not found in plugin folder.');
             return null;
         }
 
@@ -459,6 +349,11 @@ class ClaudeTerminalView extends ItemView {
             '/usr/local/bin',
             '/Library/TeX/texbin',
         ];
+        if (settings.extraPathDirs) {
+            for (const d of settings.extraPathDirs.split(',').map(s => s.trim()).filter(Boolean)) {
+                extraPaths.push(d);
+            }
+        }
         const currentPath = spawnEnv.PATH || '';
         const missingPaths = extraPaths.filter(p => !currentPath.includes(p) && fs.existsSync(p));
         if (missingPaths.length > 0) {
@@ -466,10 +361,11 @@ class ClaudeTerminalView extends ItemView {
         }
 
         const vaultRoot = this.plugin.app.vault.adapter.basePath;
+        const claudeArgs = [claudePath];
+        if (settings.skipPermissions) claudeArgs.push('--dangerously-skip-permissions');
 
         const proc = spawn(pythonPath, [
-            '-c', PTY_BRIDGE_SCRIPT,
-            claudePath, '--dangerously-skip-permissions'
+            ptyBridgePath, ...claudeArgs
         ], {
             cwd: vaultRoot,
             env: spawnEnv,
@@ -495,8 +391,29 @@ class ClaudeTerminalView extends ItemView {
             new Notice(`Claude process error: ${err.message}`);
         });
 
+        // Wire PTY output to terminal — registered once, safe across reattach
+        proc.stdout.on('data', (data) => {
+            if (session.terminal) session.terminal.write(data);
+            session.lastActivity = Date.now();
+            session.hasWorked = true;
+            if (!session.isWorking) {
+                session.isWorking = true;
+                this._updateStatusDot(session);
+                this.plugin._updateFileTreeBadges();
+            }
+            clearTimeout(session._idleTimer);
+            session._idleTimer = setTimeout(() => {
+                session.isWorking = false;
+                this._updateStatusDot(session);
+                this.plugin._updateFileTreeBadges();
+            }, 3000);
+        });
+        proc.stderr.on('data', (data) => {
+            if (session.terminal) session.terminal.write(data);
+            session.lastActivity = Date.now();
+        });
+
         proc.on('exit', (code) => {
-            console.log(`Claude Terminal: process exited with code ${code}`);
             if (session.terminal) {
                 session.terminal.write(`\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`);
             }
@@ -567,7 +484,18 @@ class ClaudeTerminalView extends ItemView {
 // ---------------------------------------------------------------------------
 const DEFAULT_SETTINGS = {
     autoOpen: true,               // auto-open sidebar when viewing a supported file
-    notifyOnSessionDone: true,    // notify when Claude session exits
+    // --- Claude process ---
+    claudeBinaryPath: '',          // '' = auto-detect (~/.local/bin/claude)
+    pythonPath: '',                 // '' = auto-detect (searches common locations)
+    extraPathDirs: '',              // comma-separated extra PATH dirs (appended to built-in list)
+    skipPermissions: true,          // pass --dangerously-skip-permissions to Claude
+    // --- Terminal appearance ---
+    terminalFontSize: 13,          // xterm font size
+    terminalScrollback: 10000,     // xterm scrollback lines
+    // --- Session behavior ---
+    idleSessionTimeout: 60,        // seconds before unused sessions are auto-closed (0 = never)
+    // --- Notifications ---
+    notifyOnSessionDone: true,     // notify when Claude session exits
 };
 
 // ---------------------------------------------------------------------------
@@ -632,7 +560,8 @@ class ClaudeTerminalPlugin extends Plugin {
                     background-color: var(--text-warning, #e6a700);
                     animation: claude-term-dot-pulse 1.5s ease-in-out infinite;
                 }
-                .claude-term-status-dot.paused {
+                .claude-term-status-dot.paused,
+                .claude-term-status-dot.active {
                     background-color: var(--text-warning, #e6a700);
                 }
                 .claude-term-status-dot.done {
@@ -1072,6 +1001,95 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
                         this.plugin.settings.notifyOnSessionDone = val;
                         await this.plugin.saveSettings();
                     })
+            );
+
+        // --- Claude process ---
+        containerEl.createEl('h3', { text: 'Claude process' });
+
+        new Setting(containerEl)
+            .setName('Claude binary path')
+            .setDesc('Path to the Claude Code binary. Leave empty to auto-detect (~/.local/bin/claude).')
+            .addText(text => text
+                .setPlaceholder('~/.local/bin/claude')
+                .setValue(this.plugin.settings.claudeBinaryPath)
+                .onChange(async (value) => {
+                    this.plugin.settings.claudeBinaryPath = value.trim();
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Python3 path')
+            .setDesc('Path to Python 3 binary. Leave empty to auto-detect.')
+            .addText(text => text
+                .setPlaceholder('auto-detect')
+                .setValue(this.plugin.settings.pythonPath)
+                .onChange(async (value) => {
+                    this.plugin.settings.pythonPath = value.trim();
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Extra PATH directories')
+            .setDesc('Comma-separated extra directories to add to PATH when spawning Claude.')
+            .addText(text => text
+                .setPlaceholder('/path/one, /path/two')
+                .setValue(this.plugin.settings.extraPathDirs)
+                .onChange(async (value) => {
+                    this.plugin.settings.extraPathDirs = value;
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Skip permission prompts')
+            .setDesc('Pass --dangerously-skip-permissions to Claude Code.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.skipPermissions)
+                .onChange(async (value) => {
+                    this.plugin.settings.skipPermissions = value;
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        // --- Terminal appearance ---
+        containerEl.createEl('h3', { text: 'Terminal appearance' });
+
+        new Setting(containerEl)
+            .setName('Terminal font size')
+            .setDesc('Font size for the xterm terminal (default: 13).')
+            .addText(text => text
+                .setPlaceholder('13')
+                .setValue(String(this.plugin.settings.terminalFontSize))
+                .onChange(async (value) => {
+                    this.plugin.settings.terminalFontSize = Math.max(8, parseInt(value) || 13);
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Terminal scrollback lines')
+            .setDesc('Number of lines to keep in terminal scrollback buffer (default: 10000).')
+            .addText(text => text
+                .setPlaceholder('10000')
+                .setValue(String(this.plugin.settings.terminalScrollback))
+                .onChange(async (value) => {
+                    this.plugin.settings.terminalScrollback = Math.max(100, parseInt(value) || 10000);
+                    await this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Idle session timeout (seconds)')
+            .setDesc('Seconds before an unused session is auto-closed when you switch away. 0 = never.')
+            .addText(text => text
+                .setPlaceholder('60')
+                .setValue(String(this.plugin.settings.idleSessionTimeout))
+                .onChange(async (value) => {
+                    this.plugin.settings.idleSessionTimeout = Math.max(0, parseInt(value) || 60);
+                    await this.plugin.saveSettings();
+                })
             );
     }
 }
