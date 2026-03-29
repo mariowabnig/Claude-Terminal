@@ -651,6 +651,23 @@ class ClaudeTerminalPlugin extends Plugin {
             (leaf) => new ClaudeTerminalView(leaf, this)
         );
 
+        // Sync xterm theme when Obsidian theme changes (light/dark switch)
+        this.registerEvent(
+            this.app.workspace.on('css-change', () => {
+                const cs = getComputedStyle(document.body);
+                const theme = {
+                    background: cs.getPropertyValue('--background-primary').trim() || '#1e1e1e',
+                    foreground: cs.getPropertyValue('--text-normal').trim() || '#d4d4d4',
+                    cursor: cs.getPropertyValue('--interactive-accent').trim() || '#528bff',
+                };
+                for (const session of this.sessions.values()) {
+                    if (session.terminal) {
+                        session.terminal.options.theme = theme;
+                    }
+                }
+            })
+        );
+
         // --- Track active file and switch sessions ---
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', (leaf) => {
