@@ -196,6 +196,7 @@ class ClaudeTerminalView extends ItemView {
 
     _detachCurrentTerminal() {
         if (this.terminal) {
+            // Note: don't dispose — session.terminal is reused on reattach
             if (this.terminalEl) {
                 while (this.terminalEl.firstChild) {
                     this.terminalEl.removeChild(this.terminalEl.firstChild);
@@ -389,6 +390,7 @@ class ClaudeTerminalView extends ItemView {
         proc.on('error', (err) => {
             console.error('Claude Terminal: process error', err);
             new Notice(`Claude process error: ${err.message}`);
+            session.exited = true;
         });
 
         // Wire PTY output to terminal — registered once, safe across reattach
@@ -436,9 +438,9 @@ class ClaudeTerminalView extends ItemView {
         if (ext === 'tex') {
             const classMatch = fileName.match(/-(\d\w)\./i);
             const className = classMatch ? classMatch[1].toUpperCase() : '';
-            initialPrompt = `We are working on "${fileKey}"${className ? ` for class ${className}` : ''}. Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: `;
+            initialPrompt = `We are working on ${JSON.stringify(fileKey)}${className ? ` for class ${className}` : ''}. Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: `;
         } else {
-            initialPrompt = `We are working on the file "${fileKey}". Read it first, then help me with the following: `;
+            initialPrompt = `We are working on the file ${JSON.stringify(fileKey)}. Read it first, then help me with the following: `;
         }
 
         // Wait for Claude to be ready, then send initial prompt
@@ -488,7 +490,7 @@ const DEFAULT_SETTINGS = {
     claudeBinaryPath: '',          // '' = auto-detect (~/.local/bin/claude)
     pythonPath: '',                 // '' = auto-detect (searches common locations)
     extraPathDirs: '',              // comma-separated extra PATH dirs (appended to built-in list)
-    skipPermissions: true,          // pass --dangerously-skip-permissions to Claude
+    skipPermissions: false,          // pass --dangerously-skip-permissions to Claude (⚠️ security risk)
     // --- Terminal appearance ---
     terminalFontSize: 13,          // xterm font size
     terminalScrollback: 10000,     // xterm scrollback lines
@@ -725,25 +727,41 @@ class ClaudeTerminalPlugin extends Plugin {
     }
 
     onunload() {
-        document.getElementById('claude-term-styles')?.remove();
-        document.getElementById('claude-term-xterm-css')?.remove();
-        clearTimeout(this._badgeDebounce);
-        this._fileTreeObserver?.disconnect();
-        document.querySelectorAll('.claude-term-badge').forEach(el => el.remove());
+        try {
+            document.getElementById('claude-term-styles')?.remove();
+            document.getElementById('claude-term-xterm-css')?.remove();
+            clearTimeout(this._badgeDebounce);
+            this._fileTreeObserver?.disconnect();
+            document.querySelectorAll('.claude-term-badge').forEach(el => el.remove());
+        } catch (e) {
+            console.warn('Claude Terminal: cleanup error (styles/observer)', e);
+        }
 
-        // Kill all sessions
+        // Kill all sessions — each wrapped individually to prevent cascading failures
         for (const session of this.sessions.values()) {
-            if (session.process && !session.process.killed) {
-                session.process.kill('SIGTERM');
+            try {
+                if (session.process && !session.process.killed) {
+                    session.process.kill('SIGTERM');
+                }
+            } catch (e) {
+                console.warn('Claude Terminal: failed to kill process', e);
             }
-            if (session.terminal) {
-                session.terminal.dispose();
+            try {
+                if (session.terminal) {
+                    session.terminal.dispose();
+                }
+            } catch (e) {
+                console.warn('Claude Terminal: failed to dispose terminal', e);
             }
         }
         this.sessions.clear();
 
         // Close view
-        this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+        try {
+            this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+        } catch (e) {
+            console.warn('Claude Terminal: failed to detach view', e);
+        }
 
         console.log('Claude Terminal unloaded');
     }

@@ -70,7 +70,10 @@ def main():
                         line, buf = buf.split(b'\n', 1)
                         parts = line.decode().strip().split(',')
                         if len(parts) == 2:
-                            handle_resize(int(parts[0]), int(parts[1]))
+                            try:
+                                handle_resize(int(parts[0]), int(parts[1]))
+                            except ValueError:
+                                pass  # ignore malformed resize data
                 except OSError:
                     break
 
