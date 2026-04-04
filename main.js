@@ -310,10 +310,42 @@ class ClaudeTerminalView extends ItemView {
         const settings = this.plugin.settings;
         const homeDir = require('os').homedir();
 
-        // Resolve Claude binary path
-        const claudePath = settings.claudeBinaryPath || path.join(homeDir, '.local/bin/claude');
-        if (!fs.existsSync(claudePath)) {
-            new Notice(`Claude Code not found at ${claudePath}. Check plugin settings.`);
+        // Resolve CLI binary path based on selected backend
+        const isCodex = settings.cliBackend === 'codex';
+        const cliName = isCodex ? 'Codex' : 'Claude Code';
+        let cliBinaryPath;
+        if (isCodex) {
+            cliBinaryPath = settings.codexBinaryPath || '';
+            // Auto-detect: check common locations including nvm
+            if (!cliBinaryPath || !fs.existsSync(cliBinaryPath)) {
+                const candidates = [
+                    path.join(homeDir, '.local/bin/codex'),
+                    '/opt/homebrew/bin/codex',
+                    '/usr/local/bin/codex',
+                ];
+                // Also check nvm current node bin
+                const nvmDir = spawnEnv.NVM_DIR || path.join(homeDir, '.nvm');
+                try {
+                    const nvmCurrent = path.join(nvmDir, 'alias', 'default');
+                    // Simpler: just look through nvm node versions for codex
+                    const nvmVersions = path.join(nvmDir, 'versions', 'node');
+                    if (fs.existsSync(nvmVersions)) {
+                        const versions = fs.readdirSync(nvmVersions).reverse(); // newest first
+                        for (const v of versions) {
+                            candidates.push(path.join(nvmVersions, v, 'bin', 'codex'));
+                        }
+                    }
+                } catch(e) {}
+                cliBinaryPath = '';
+                for (const p of candidates) {
+                    if (fs.existsSync(p)) { cliBinaryPath = p; break; }
+                }
+            }
+        } else {
+            cliBinaryPath = settings.claudeBinaryPath || path.join(homeDir, '.local/bin/claude');
+        }
+        if (!fs.existsSync(cliBinaryPath)) {
+            new Notice(`${cliName} not found at ${cliBinaryPath}. Check plugin settings.`);
             return null;
         }
 
@@ -350,6 +382,13 @@ class ClaudeTerminalView extends ItemView {
             '/usr/local/bin',
             '/Library/TeX/texbin',
         ];
+        // If using codex from nvm, ensure its bin dir is on PATH
+        if (isCodex && cliBinaryPath) {
+            const cliBinDir = path.dirname(cliBinaryPath);
+            if (!extraPaths.includes(cliBinDir)) {
+                extraPaths.unshift(cliBinDir);
+            }
+        }
         if (settings.extraPathDirs) {
             for (const d of settings.extraPathDirs.split(',').map(s => s.trim()).filter(Boolean)) {
                 extraPaths.push(d);
@@ -362,11 +401,15 @@ class ClaudeTerminalView extends ItemView {
         }
 
         const vaultRoot = this.plugin.app.vault.adapter.basePath;
-        const claudeArgs = [claudePath];
-        if (settings.skipPermissions) claudeArgs.push('--dangerously-skip-permissions');
+        const cliArgs = [cliBinaryPath];
+        if (isCodex) {
+            cliArgs.push('--full-auto');
+        } else if (settings.skipPermissions) {
+            cliArgs.push('--dangerously-skip-permissions');
+        }
 
         const proc = spawn(pythonPath, [
-            ptyBridgePath, ...claudeArgs
+            ptyBridgePath, ...cliArgs
         ], {
             cwd: vaultRoot,
             env: spawnEnv,
@@ -389,7 +432,7 @@ class ClaudeTerminalView extends ItemView {
 
         proc.on('error', (err) => {
             console.error('Claude Terminal: process error', err);
-            new Notice(`Claude process error: ${err.message}`);
+            new Notice(`${cliName} process error: ${err.message}`);
             session.exited = true;
         });
 
@@ -425,7 +468,7 @@ class ClaudeTerminalView extends ItemView {
             this._updateStatusDot(session);
             if (this.plugin.settings.notifyOnSessionDone) {
                 const status = code === 0 ? 'completed' : `exited (code ${code})`;
-                new Notice(`Claude session ${status}: ${path.basename(fileKey)}`, 5000);
+                new Notice(`${cliName} session ${status}: ${path.basename(fileKey)}`, 5000);
             }
             this.plugin._updateFileTreeBadges();
         });
@@ -459,7 +502,7 @@ class ClaudeTerminalView extends ItemView {
 
         const readyListener = (data) => {
             outputBuf += data.toString();
-            if (outputBuf.includes('>') || outputBuf.includes('\u276f') || outputBuf.includes('Claude')) {
+            if (outputBuf.includes('>') || outputBuf.includes('\u276f') || outputBuf.includes('Claude') || outputBuf.includes('Codex') || outputBuf.includes('codex')) {
                 proc.stdout.removeListener('data', readyListener);
                 setTimeout(sendInitialPrompt, 500);
             }
@@ -486,8 +529,11 @@ class ClaudeTerminalView extends ItemView {
 // ---------------------------------------------------------------------------
 const DEFAULT_SETTINGS = {
     autoOpen: true,               // auto-open sidebar when viewing a supported file
+    // --- CLI backend ---
+    cliBackend: 'claude',          // 'claude' or 'codex'
     // --- Claude process ---
     claudeBinaryPath: '',          // '' = auto-detect (~/.local/bin/claude)
+    codexBinaryPath: '',           // '' = auto-detect (npx-resolved or ~/.local/bin/codex)
     pythonPath: '',                 // '' = auto-detect (searches common locations)
     extraPathDirs: '',              // comma-separated extra PATH dirs (appended to built-in list)
     skipPermissions: false,          // pass --dangerously-skip-permissions to Claude (⚠️ security risk)
@@ -1038,20 +1084,52 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
                     })
             );
 
-        // --- Claude process ---
-        containerEl.createEl('h3', { text: 'Claude process' });
+        // --- CLI backend ---
+        containerEl.createEl('h3', { text: 'CLI backend' });
 
         new Setting(containerEl)
-            .setName('Claude binary path')
-            .setDesc('Path to the Claude Code binary. Leave empty to auto-detect (~/.local/bin/claude).')
-            .addText(text => text
-                .setPlaceholder('~/.local/bin/claude')
-                .setValue(this.plugin.settings.claudeBinaryPath)
+            .setName('CLI backend')
+            .setDesc('Choose which AI coding CLI to use for terminal sessions.')
+            .addDropdown(dropdown => dropdown
+                .addOption('claude', 'Claude Code')
+                .addOption('codex', 'Codex')
+                .setValue(this.plugin.settings.cliBackend)
                 .onChange(async (value) => {
-                    this.plugin.settings.claudeBinaryPath = value.trim();
+                    this.plugin.settings.cliBackend = value;
                     await this.plugin.saveSettings();
+                    this.display(); // re-render to show/hide backend-specific settings
                 })
             );
+
+        const isCodex = this.plugin.settings.cliBackend === 'codex';
+
+        if (!isCodex) {
+            new Setting(containerEl)
+                .setName('Claude binary path')
+                .setDesc('Path to the Claude Code binary. Leave empty to auto-detect (~/.local/bin/claude).')
+                .addText(text => text
+                    .setPlaceholder('~/.local/bin/claude')
+                    .setValue(this.plugin.settings.claudeBinaryPath)
+                    .onChange(async (value) => {
+                        this.plugin.settings.claudeBinaryPath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+                );
+        }
+
+        if (isCodex) {
+            new Setting(containerEl)
+                .setName('Codex binary path')
+                .setDesc('Path to the Codex binary. Leave empty to auto-detect.')
+                .addText(text => text
+                    .setPlaceholder('auto-detect')
+                    .setValue(this.plugin.settings.codexBinaryPath)
+                    .onChange(async (value) => {
+                        this.plugin.settings.codexBinaryPath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+                );
+        }
 
         new Setting(containerEl)
             .setName('Python3 path')
@@ -1067,7 +1145,7 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Extra PATH directories')
-            .setDesc('Comma-separated extra directories to add to PATH when spawning Claude.')
+            .setDesc('Comma-separated extra directories to add to PATH when spawning the CLI.')
             .addText(text => text
                 .setPlaceholder('/path/one, /path/two')
                 .setValue(this.plugin.settings.extraPathDirs)
@@ -1077,16 +1155,18 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
                 })
             );
 
-        new Setting(containerEl)
-            .setName('Skip permission prompts')
-            .setDesc('Pass --dangerously-skip-permissions to Claude Code.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.skipPermissions)
-                .onChange(async (value) => {
-                    this.plugin.settings.skipPermissions = value;
-                    await this.plugin.saveSettings();
-                })
-            );
+        if (!isCodex) {
+            new Setting(containerEl)
+                .setName('Skip permission prompts')
+                .setDesc('Pass --dangerously-skip-permissions to Claude Code.')
+                .addToggle(toggle => toggle
+                    .setValue(this.plugin.settings.skipPermissions)
+                    .onChange(async (value) => {
+                        this.plugin.settings.skipPermissions = value;
+                        await this.plugin.saveSettings();
+                    })
+                );
+        }
 
         // --- Terminal appearance ---
         containerEl.createEl('h3', { text: 'Terminal appearance' });
