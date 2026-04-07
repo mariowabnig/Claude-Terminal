@@ -766,6 +766,126 @@ class ClaudeTerminalPlugin extends Plugin {
             },
         });
 
+        this.addCommand({
+            id: 'switch-backend',
+            name: 'Switch AI Backend (Claude ↔ Codex)',
+            callback: () => {
+                this.settings.cliBackend = this.settings.cliBackend === 'claude' ? 'codex' : 'claude';
+                this.saveSettings();
+                new Notice(`Backend switched to ${this.settings.cliBackend}`);
+            },
+        });
+
+        this.addCommand({
+            id: 'kill-active-session',
+            name: 'Kill Active Session',
+            callback: () => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !this.sessions.has(file.path)) {
+                    new Notice('No active session for current file.');
+                    return;
+                }
+                const session = this.sessions.get(file.path);
+                if (session.process && !session.process.killed) session.process.kill('SIGTERM');
+                if (session.terminal) session.terminal.dispose();
+                this.sessions.delete(file.path);
+                this._updateFileTreeBadges();
+                new Notice(`Session killed for ${file.name}`);
+            },
+        });
+
+        this.addCommand({
+            id: 'kill-all-sessions',
+            name: 'Kill All Sessions',
+            callback: () => {
+                const count = this.sessions.size;
+                for (const session of this.sessions.values()) {
+                    if (session.process && !session.process.killed) session.process.kill('SIGTERM');
+                    if (session.terminal) session.terminal.dispose();
+                }
+                this.sessions.clear();
+                this._updateFileTreeBadges();
+                new Notice(`Killed ${count} session(s).`);
+            },
+        });
+
+        this.addCommand({
+            id: 'restart-session',
+            name: 'Restart Session',
+            callback: async () => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !isSupportedFile(file)) {
+                    new Notice('No supported file is currently active.');
+                    return;
+                }
+                const fileKey = file.path;
+                const session = this.sessions.get(fileKey);
+                if (session) {
+                    if (session.process && !session.process.killed) session.process.kill('SIGTERM');
+                    if (session.terminal) session.terminal.dispose();
+                    this.sessions.delete(fileKey);
+                }
+                await this._openTerminalForFile(file);
+                new Notice(`Session restarted for ${file.name}`);
+            },
+        });
+
+        this.addCommand({
+            id: 'toggle-auto-open',
+            name: 'Toggle Auto-Open',
+            callback: () => {
+                this.settings.autoOpen = !this.settings.autoOpen;
+                this.saveSettings();
+                new Notice(`Auto-open ${this.settings.autoOpen ? 'enabled' : 'disabled'}`);
+            },
+        });
+
+        this.addCommand({
+            id: 'send-initial-prompt',
+            name: 'Send Initial Prompt',
+            callback: () => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !this.sessions.has(file.path)) {
+                    new Notice('No active session for current file.');
+                    return;
+                }
+                const session = this.sessions.get(file.path);
+                session.initialPromptSent = false;
+                // Re-trigger the initial prompt logic by writing to stdin
+                const absPath = path.join(this.app.vault.adapter.basePath, file.path);
+                const prompt = `Focus on: ${absPath}\n`;
+                try {
+                    session.process.stdin.write(prompt);
+                    new Notice('Initial prompt re-sent.');
+                } catch (e) {
+                    new Notice('Failed to send prompt — session may have exited.');
+                }
+            },
+        });
+
+        this.addCommand({
+            id: 'clear-terminal',
+            name: 'Clear Terminal',
+            callback: () => {
+                const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+                if (termLeaves.length === 0) return;
+                const view = termLeaves[0].view;
+                if (view instanceof ClaudeTerminalView && view.terminal) {
+                    view.terminal.clear();
+                    new Notice('Terminal cleared.');
+                }
+            },
+        });
+
+        this.addCommand({
+            id: 'open-settings',
+            name: 'Open Settings',
+            callback: () => {
+                this.app.setting.open();
+                this.app.setting.openTabById('claude-terminal');
+            },
+        });
+
         // --- Settings ---
         this.addSettingTab(new ClaudeTerminalSettingTab(this.app, this));
 
