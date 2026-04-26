@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Claude Terminal
 
 > **Required Reading:** See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design, data flow, and patterns.
