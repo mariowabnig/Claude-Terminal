@@ -1,6 +1,6 @@
 /*
- * Claude Terminal — Obsidian Plugin
- * Right-sidebar Claude Code terminal that follows the currently viewed file.
+ * AI Agent Terminal — Obsidian Plugin
+ * Right-sidebar AI coding terminal that follows the currently viewed file.
  * Persistent sessions per file, status badges in the file tree.
  */
 
@@ -25,7 +25,7 @@ function getSessionStatus(session) {
     return 'idle';
 }
 
-// File extensions we support (basically: text files you'd want Claude to work on)
+// File extensions we support (basically: text files you'd want an AI agent to work on)
 const SUPPORTED_EXTENSIONS = new Set([
     'tex', 'md', 'js', 'ts', 'jsx', 'tsx', 'css', 'scss', 'html',
     'py', 'rb', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'hpp',
@@ -40,8 +40,159 @@ function isSupportedFile(file) {
     return SUPPORTED_EXTENSIONS.has(file.extension);
 }
 
+function expandHome(filePath, homeDir) {
+    if (!filePath) return '';
+    return filePath.startsWith('~/') ? path.join(homeDir, filePath.slice(2)) : filePath;
+}
+
+function splitShellArgs(input) {
+    const args = [];
+    let current = '';
+    let quote = null;
+    let escaped = false;
+
+    for (const ch of input || '') {
+        if (escaped) {
+            current += ch;
+            escaped = false;
+            continue;
+        }
+        if (ch === '\\') {
+            escaped = true;
+            continue;
+        }
+        if (quote) {
+            if (ch === quote) {
+                quote = null;
+            } else {
+                current += ch;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch;
+            continue;
+        }
+        if (/\s/.test(ch)) {
+            if (current) {
+                args.push(current);
+                current = '';
+            }
+            continue;
+        }
+        current += ch;
+    }
+
+    if (escaped) current += '\\';
+    if (current) args.push(current);
+    return args;
+}
+
+function getBackendSettings(settings) {
+    const backend = ['claude', 'codex', 'custom'].includes(settings.cliBackend)
+        ? settings.cliBackend
+        : 'claude';
+    const customName = (settings.customDisplayName || '').trim();
+    const displayName = backend === 'claude' ? 'Claude Code'
+        : backend === 'codex' ? 'Codex'
+        : customName || 'Custom CLI';
+    return { backend, displayName };
+}
+
+function getBuiltinPrompt(fileKey, file, agentName) {
+    const fileName = path.basename(fileKey);
+    const ext = file?.extension || '';
+    const classMatch = fileName.match(/-(\d\w)\./i);
+    const className = classMatch ? classMatch[1].toUpperCase() : '';
+
+    if (ext === 'tex') {
+        return `We are working on ${JSON.stringify(fileKey)}${className ? ` for class ${className}` : ''}. Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: `;
+    }
+
+    return `We are working on the file ${JSON.stringify(fileKey)}. Read it first, then help me with the following: `;
+}
+
+function renderPromptTemplate(template, context) {
+    return (template || '').replace(/\{(filePath|fileName|className|agentName)\}/g, (_, key) => context[key] || '');
+}
+
+function getInitialPrompt(settings, fileKey, file, agentName) {
+    const builtinPrompt = getBuiltinPrompt(fileKey, file, agentName);
+    if (getBackendSettings(settings).backend !== 'custom') return builtinPrompt;
+
+    const fileName = path.basename(fileKey);
+    const classMatch = fileName.match(/-(\d\w)\./i);
+    const template = file?.extension === 'tex'
+        ? settings.customTexPromptTemplate
+        : settings.customPromptTemplate;
+    if (!template || !template.trim()) return builtinPrompt;
+
+    return renderPromptTemplate(template, {
+        filePath: fileKey,
+        fileName,
+        className: classMatch ? classMatch[1].toUpperCase() : '',
+        agentName,
+    });
+}
+
+function getNvmCodexCandidates(homeDir, env) {
+    const candidates = [];
+    const nvmDirs = [
+        env.NVM_DIR,
+        path.join(homeDir, '.nvm'),
+    ].filter(Boolean);
+
+    for (const nvmDir of [...new Set(nvmDirs)]) {
+        const versionsDir = path.join(nvmDir, 'versions', 'node');
+        try {
+            if (!fs.existsSync(versionsDir)) continue;
+            const versions = fs.readdirSync(versionsDir)
+                .filter(v => fs.existsSync(path.join(versionsDir, v, 'bin', 'codex')))
+                .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+            for (const version of versions) {
+                candidates.push(path.join(versionsDir, version, 'bin', 'codex'));
+            }
+        } catch(e) {}
+    }
+
+    return candidates;
+}
+
+function resolveBackendCommand(settings, homeDir, env) {
+    const { backend, displayName } = getBackendSettings(settings);
+    let configuredPath = '';
+    let candidates = [];
+    let fixedArgs = [];
+
+    if (backend === 'claude') {
+        configuredPath = expandHome(settings.claudeBinaryPath, homeDir);
+        candidates = configuredPath ? [configuredPath] : [
+            path.join(homeDir, '.local/bin/claude'),
+            '/opt/homebrew/bin/claude',
+            '/usr/local/bin/claude',
+        ];
+        fixedArgs = settings.skipPermissions ? ['--dangerously-skip-permissions'] : [];
+    } else if (backend === 'codex') {
+        configuredPath = expandHome(settings.codexBinaryPath, homeDir);
+        candidates = configuredPath ? [configuredPath] : [
+            path.join(homeDir, '.local/bin/codex'),
+            '/opt/homebrew/bin/codex',
+            '/usr/local/bin/codex',
+            ...getNvmCodexCandidates(homeDir, env),
+        ];
+        fixedArgs = ['--sandbox', 'danger-full-access', '--ask-for-approval', 'never'];
+    } else {
+        configuredPath = expandHome(settings.customBinaryPath, homeDir);
+        candidates = [configuredPath].filter(Boolean);
+        fixedArgs = splitShellArgs(settings.customFixedArgs || '');
+    }
+
+    const binaryPath = candidates.find(p => p && fs.existsSync(p)) || '';
+    return { backend, displayName, binaryPath, fixedArgs, configuredPath };
+}
+
 // ---------------------------------------------------------------------------
-// Claude Terminal View — right sidebar with xterm.js terminal
+// AI Agent Terminal View — right sidebar with xterm.js terminal
 // ---------------------------------------------------------------------------
 class ClaudeTerminalView extends ItemView {
     constructor(leaf, plugin) {
@@ -57,7 +208,7 @@ class ClaudeTerminalView extends ItemView {
     }
 
     getViewType() { return VIEW_TYPE; }
-    getDisplayText() { return 'Claude Terminal'; }
+    getDisplayText() { return 'AI Agent Terminal'; }
     getIcon() { return 'terminal'; }
 
     async onOpen() {
@@ -98,7 +249,7 @@ class ClaudeTerminalView extends ItemView {
         const basePath = this.app.vault.adapter.basePath;
 
         if (!pluginDir || !basePath) {
-            console.error('Claude Terminal: cannot resolve plugin path');
+            console.error('AI Agent Terminal: cannot resolve plugin path');
             return;
         }
 
@@ -140,7 +291,7 @@ class ClaudeTerminalView extends ItemView {
                 this._xtermModule = loadUMD(xtermCode);
                 this._fitModule = loadUMD(fitCode);
             } catch (e2) {
-                console.error('Claude Terminal: all xterm loading approaches failed', e2);
+                console.error('AI Agent Terminal: all xterm loading approaches failed', e2);
                 return;
             }
         }
@@ -310,42 +461,15 @@ class ClaudeTerminalView extends ItemView {
         const settings = this.plugin.settings;
         const homeDir = require('os').homedir();
 
-        // Resolve CLI binary path based on selected backend
-        const isCodex = settings.cliBackend === 'codex';
-        const cliName = isCodex ? 'Codex' : 'Claude Code';
-        let cliBinaryPath;
-        if (isCodex) {
-            cliBinaryPath = settings.codexBinaryPath || '';
-            // Auto-detect: check common locations including nvm
-            if (!cliBinaryPath || !fs.existsSync(cliBinaryPath)) {
-                const candidates = [
-                    path.join(homeDir, '.local/bin/codex'),
-                    '/opt/homebrew/bin/codex',
-                    '/usr/local/bin/codex',
-                ];
-                // Also check nvm current node bin
-                const nvmDir = spawnEnv.NVM_DIR || path.join(homeDir, '.nvm');
-                try {
-                    const nvmCurrent = path.join(nvmDir, 'alias', 'default');
-                    // Simpler: just look through nvm node versions for codex
-                    const nvmVersions = path.join(nvmDir, 'versions', 'node');
-                    if (fs.existsSync(nvmVersions)) {
-                        const versions = fs.readdirSync(nvmVersions).reverse(); // newest first
-                        for (const v of versions) {
-                            candidates.push(path.join(nvmVersions, v, 'bin', 'codex'));
-                        }
-                    }
-                } catch(e) {}
-                cliBinaryPath = '';
-                for (const p of candidates) {
-                    if (fs.existsSync(p)) { cliBinaryPath = p; break; }
-                }
-            }
-        } else {
-            cliBinaryPath = settings.claudeBinaryPath || path.join(homeDir, '.local/bin/claude');
-        }
-        if (!fs.existsSync(cliBinaryPath)) {
-            new Notice(`${cliName} not found at ${cliBinaryPath}. Check plugin settings.`);
+        // Build env before backend resolution so Codex nvm detection can use NVM_DIR.
+        const spawnEnv = { ...globalThis.process.env, TERM: 'xterm-256color', PYTHONIOENCODING: 'utf-8' };
+        delete spawnEnv.CLAUDECODE;
+
+        const command = resolveBackendCommand(settings, homeDir, spawnEnv);
+        const { backend, displayName: cliName, binaryPath: cliBinaryPath } = command;
+        if (!cliBinaryPath) {
+            const configured = command.configuredPath ? ` at ${command.configuredPath}` : '';
+            new Notice(`${cliName} binary not found${configured}. Check AI Agent Terminal settings.`);
             return null;
         }
 
@@ -370,10 +494,6 @@ class ClaudeTerminalView extends ItemView {
             return null;
         }
 
-        // Build env
-        const spawnEnv = { ...globalThis.process.env, TERM: 'xterm-256color', PYTHONIOENCODING: 'utf-8' };
-        delete spawnEnv.CLAUDECODE;
-
         const extraPaths = [
             path.join(homeDir, 'Library/TinyTeX/bin/universal-darwin'),
             path.join(homeDir, '.local/bin'),
@@ -382,8 +502,8 @@ class ClaudeTerminalView extends ItemView {
             '/usr/local/bin',
             '/Library/TeX/texbin',
         ];
-        // If using codex from nvm, ensure its bin dir is on PATH
-        if (isCodex && cliBinaryPath) {
+        // If using a detected binary from nvm or a custom location, ensure its bin dir is on PATH.
+        if (cliBinaryPath) {
             const cliBinDir = path.dirname(cliBinaryPath);
             if (!extraPaths.includes(cliBinDir)) {
                 extraPaths.unshift(cliBinDir);
@@ -401,12 +521,7 @@ class ClaudeTerminalView extends ItemView {
         }
 
         const vaultRoot = this.plugin.app.vault.adapter.basePath;
-        const cliArgs = [cliBinaryPath];
-        if (isCodex) {
-            cliArgs.push('--full-auto');
-        } else if (settings.skipPermissions) {
-            cliArgs.push('--dangerously-skip-permissions');
-        }
+        const cliArgs = [cliBinaryPath, ...command.fixedArgs];
 
         const proc = spawn(pythonPath, [
             ptyBridgePath, ...cliArgs
@@ -420,6 +535,8 @@ class ClaudeTerminalView extends ItemView {
             key: fileKey,
             absPath,
             file,
+            backend,
+            displayName: cliName,
             process: proc,
             resizePipe: proc.stdio[3],
             terminal: null,
@@ -431,7 +548,7 @@ class ClaudeTerminalView extends ItemView {
         };
 
         proc.on('error', (err) => {
-            console.error('Claude Terminal: process error', err);
+            console.error('AI Agent Terminal: process error', err);
             new Notice(`${cliName} process error: ${err.message}`);
             session.exited = true;
         });
@@ -473,20 +590,9 @@ class ClaudeTerminalView extends ItemView {
             this.plugin._updateFileTreeBadges();
         });
 
-        // Build context-aware initial prompt based on file type
-        const fileName = path.basename(fileKey);
-        const ext = file?.extension || '';
-        let initialPrompt;
+        const initialPrompt = getInitialPrompt(settings, fileKey, file, cliName);
 
-        if (ext === 'tex') {
-            const classMatch = fileName.match(/-(\d\w)\./i);
-            const className = classMatch ? classMatch[1].toUpperCase() : '';
-            initialPrompt = `We are working on ${JSON.stringify(fileKey)}${className ? ` for class ${className}` : ''}. Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: `;
-        } else {
-            initialPrompt = `We are working on the file ${JSON.stringify(fileKey)}. Read it first, then help me with the following: `;
-        }
-
-        // Wait for Claude to be ready, then send initial prompt
+        // Wait for the selected CLI to be ready, then send initial prompt.
         let outputBuf = '';
         const sendInitialPrompt = () => {
             if (session.initialPromptSent || !proc || proc.killed) return;
@@ -502,7 +608,7 @@ class ClaudeTerminalView extends ItemView {
 
         const readyListener = (data) => {
             outputBuf += data.toString();
-            if (outputBuf.includes('>') || outputBuf.includes('\u276f') || outputBuf.includes('Claude') || outputBuf.includes('Codex') || outputBuf.includes('codex')) {
+            if (outputBuf.includes('>') || outputBuf.includes('\u276f') || outputBuf.includes('Claude') || outputBuf.includes('Codex') || outputBuf.includes('codex') || outputBuf.includes(cliName)) {
                 proc.stdout.removeListener('data', readyListener);
                 setTimeout(sendInitialPrompt, 500);
             }
@@ -530,10 +636,15 @@ class ClaudeTerminalView extends ItemView {
 const DEFAULT_SETTINGS = {
     autoOpen: true,               // auto-open sidebar when viewing a supported file
     // --- CLI backend ---
-    cliBackend: 'claude',          // 'claude' or 'codex'
+    cliBackend: 'claude',          // 'claude', 'codex', or 'custom'
     // --- Claude process ---
     claudeBinaryPath: '',          // '' = auto-detect (~/.local/bin/claude)
-    codexBinaryPath: '',           // '' = auto-detect (npx-resolved or ~/.local/bin/codex)
+    codexBinaryPath: '',           // '' = auto-detect common locations including nvm
+    customDisplayName: 'Custom CLI',
+    customBinaryPath: '',
+    customFixedArgs: '',
+    customPromptTemplate: '',
+    customTexPromptTemplate: '',
     pythonPath: '',                 // '' = auto-detect (searches common locations)
     extraPathDirs: '',              // comma-separated extra PATH dirs (appended to built-in list)
     skipPermissions: false,          // pass --dangerously-skip-permissions to Claude (⚠️ security risk)
@@ -543,7 +654,7 @@ const DEFAULT_SETTINGS = {
     // --- Session behavior ---
     idleSessionTimeout: 60,        // seconds before unused sessions are auto-closed (0 = never)
     // --- Notifications ---
-    notifyOnSessionDone: true,     // notify when Claude session exits
+    notifyOnSessionDone: true,     // notify when an agent session exits
 };
 
 // ---------------------------------------------------------------------------
@@ -734,16 +845,17 @@ class ClaudeTerminalPlugin extends Plugin {
         );
 
         // --- Commands ---
+        const activeBackendName = getBackendSettings(this.settings).displayName;
         this.addCommand({
             id: 'toggle-claude-terminal',
-            name: 'Toggle Claude Terminal sidebar',
+            name: `Toggle AI Agent Terminal sidebar (${activeBackendName})`,
             hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'L' }],
             callback: () => this.toggleTerminal(),
         });
 
         this.addCommand({
             id: 'open-claude-for-file',
-            name: 'Open Claude Terminal for current file',
+            name: `Open AI Agent Terminal for current file (${activeBackendName})`,
             callback: () => {
                 const file = this.app.workspace.getActiveFile();
                 if (file && isSupportedFile(file)) {
@@ -756,140 +868,20 @@ class ClaudeTerminalPlugin extends Plugin {
 
         this.addCommand({
             id: 'list-sessions',
-            name: 'Show active Claude sessions',
+            name: `Show active AI Agent Terminal sessions (${activeBackendName})`,
             callback: () => {
                 if (this.sessions.size === 0) {
-                    new Notice('No active Claude sessions.');
+                    new Notice('No active AI Agent Terminal sessions.');
                     return;
                 }
                 new SessionPickerModal(this.app, this).open();
             },
         });
 
-        this.addCommand({
-            id: 'switch-backend',
-            name: 'Switch AI Backend (Claude ↔ Codex)',
-            callback: () => {
-                this.settings.cliBackend = this.settings.cliBackend === 'claude' ? 'codex' : 'claude';
-                this.saveSettings();
-                new Notice(`Backend switched to ${this.settings.cliBackend}`);
-            },
-        });
-
-        this.addCommand({
-            id: 'kill-active-session',
-            name: 'Kill Active Session',
-            callback: () => {
-                const file = this.app.workspace.getActiveFile();
-                if (!file || !this.sessions.has(file.path)) {
-                    new Notice('No active session for current file.');
-                    return;
-                }
-                const session = this.sessions.get(file.path);
-                if (session.process && !session.process.killed) session.process.kill('SIGTERM');
-                if (session.terminal) session.terminal.dispose();
-                this.sessions.delete(file.path);
-                this._updateFileTreeBadges();
-                new Notice(`Session killed for ${file.name}`);
-            },
-        });
-
-        this.addCommand({
-            id: 'kill-all-sessions',
-            name: 'Kill All Sessions',
-            callback: () => {
-                const count = this.sessions.size;
-                for (const session of this.sessions.values()) {
-                    if (session.process && !session.process.killed) session.process.kill('SIGTERM');
-                    if (session.terminal) session.terminal.dispose();
-                }
-                this.sessions.clear();
-                this._updateFileTreeBadges();
-                new Notice(`Killed ${count} session(s).`);
-            },
-        });
-
-        this.addCommand({
-            id: 'restart-session',
-            name: 'Restart Session',
-            callback: async () => {
-                const file = this.app.workspace.getActiveFile();
-                if (!file || !isSupportedFile(file)) {
-                    new Notice('No supported file is currently active.');
-                    return;
-                }
-                const fileKey = file.path;
-                const session = this.sessions.get(fileKey);
-                if (session) {
-                    if (session.process && !session.process.killed) session.process.kill('SIGTERM');
-                    if (session.terminal) session.terminal.dispose();
-                    this.sessions.delete(fileKey);
-                }
-                await this._openTerminalForFile(file);
-                new Notice(`Session restarted for ${file.name}`);
-            },
-        });
-
-        this.addCommand({
-            id: 'toggle-auto-open',
-            name: 'Toggle Auto-Open',
-            callback: () => {
-                this.settings.autoOpen = !this.settings.autoOpen;
-                this.saveSettings();
-                new Notice(`Auto-open ${this.settings.autoOpen ? 'enabled' : 'disabled'}`);
-            },
-        });
-
-        this.addCommand({
-            id: 'send-initial-prompt',
-            name: 'Send Initial Prompt',
-            callback: () => {
-                const file = this.app.workspace.getActiveFile();
-                if (!file || !this.sessions.has(file.path)) {
-                    new Notice('No active session for current file.');
-                    return;
-                }
-                const session = this.sessions.get(file.path);
-                session.initialPromptSent = false;
-                // Re-trigger the initial prompt logic by writing to stdin
-                const absPath = path.join(this.app.vault.adapter.basePath, file.path);
-                const prompt = `Focus on: ${absPath}\n`;
-                try {
-                    session.process.stdin.write(prompt);
-                    new Notice('Initial prompt re-sent.');
-                } catch (e) {
-                    new Notice('Failed to send prompt — session may have exited.');
-                }
-            },
-        });
-
-        this.addCommand({
-            id: 'clear-terminal',
-            name: 'Clear Terminal',
-            callback: () => {
-                const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-                if (termLeaves.length === 0) return;
-                const view = termLeaves[0].view;
-                if (view instanceof ClaudeTerminalView && view.terminal) {
-                    view.terminal.clear();
-                    new Notice('Terminal cleared.');
-                }
-            },
-        });
-
-        this.addCommand({
-            id: 'open-settings',
-            name: 'Open Settings',
-            callback: () => {
-                this.app.setting.open();
-                this.app.setting.openTabById('claude-terminal');
-            },
-        });
-
         // --- Settings ---
         this.addSettingTab(new ClaudeTerminalSettingTab(this.app, this));
 
-        console.log('Claude Terminal loaded');
+        console.log('AI Agent Terminal loaded');
     }
 
     onunload() {
@@ -900,7 +892,7 @@ class ClaudeTerminalPlugin extends Plugin {
             this._fileTreeObserver?.disconnect();
             document.querySelectorAll('.claude-term-badge').forEach(el => el.remove());
         } catch (e) {
-            console.warn('Claude Terminal: cleanup error (styles/observer)', e);
+            console.warn('AI Agent Terminal: cleanup error (styles/observer)', e);
         }
 
         // Kill all sessions — each wrapped individually to prevent cascading failures
@@ -910,14 +902,14 @@ class ClaudeTerminalPlugin extends Plugin {
                     session.process.kill('SIGTERM');
                 }
             } catch (e) {
-                console.warn('Claude Terminal: failed to kill process', e);
+                console.warn('AI Agent Terminal: failed to kill process', e);
             }
             try {
                 if (session.terminal) {
                     session.terminal.dispose();
                 }
             } catch (e) {
-                console.warn('Claude Terminal: failed to dispose terminal', e);
+                console.warn('AI Agent Terminal: failed to dispose terminal', e);
             }
         }
         this.sessions.clear();
@@ -926,10 +918,10 @@ class ClaudeTerminalPlugin extends Plugin {
         try {
             this.app.workspace.detachLeavesOfType(VIEW_TYPE);
         } catch (e) {
-            console.warn('Claude Terminal: failed to detach view', e);
+            console.warn('AI Agent Terminal: failed to detach view', e);
         }
 
-        console.log('Claude Terminal unloaded');
+        console.log('AI Agent Terminal unloaded');
     }
 
     // -----------------------------------------------------------------------
@@ -1023,7 +1015,7 @@ class ClaudeTerminalPlugin extends Plugin {
 
     _autoCloseSession(session) {
         if (session.userInteracted || session.exited) return;
-        console.log(`Claude Terminal: auto-closing unused session for "${session.key}"`);
+        console.log(`AI Agent Terminal: auto-closing unused session for "${session.key}"`);
 
         // Kill the process
         if (session.process && !session.process.killed) {
@@ -1036,6 +1028,42 @@ class ClaudeTerminalPlugin extends Plugin {
         // Remove from sessions map
         this.sessions.delete(session.key);
         this._updateFileTreeBadges();
+    }
+
+    _closeAllSessions() {
+        for (const session of this.sessions.values()) {
+            clearTimeout(session._autoCloseTimer);
+            clearTimeout(session._idleTimer);
+            try {
+                if (session.process && !session.process.killed) {
+                    session.process.kill('SIGTERM');
+                }
+            } catch(e) {}
+            try {
+                if (session.terminal) {
+                    session.terminal.dispose();
+                }
+            } catch(e) {}
+        }
+        this.sessions.clear();
+        this._updateFileTreeBadges();
+    }
+
+    async _restartOpenTerminalForActiveFile() {
+        const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+        if (termLeaves.length === 0) return;
+
+        const view = termLeaves[0].view;
+        if (!(view instanceof ClaudeTerminalView)) return;
+
+        view._detachCurrentTerminal();
+        view.currentFileKey = null;
+        const file = this.app.workspace.getActiveFile();
+        if (file && isSupportedFile(file)) {
+            await this._openTerminalForFile(file);
+        } else if (view.headerLabel) {
+            view.headerLabel.textContent = 'No file selected';
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1078,9 +1106,10 @@ class ClaudeTerminalPlugin extends Plugin {
                            : 'is-done';
             badge.className = `claude-term-badge ${badgeCls}`;
             badge.textContent = status === 'done' ? '\u2713' : '\u25cf';
-            badge.title = status === 'working' ? 'Claude is working...'
-                        : status === 'idle' ? 'Claude session idle'
-                        : 'Claude session finished';
+            const agentName = session.displayName || 'AI agent';
+            badge.title = status === 'working' ? `${agentName} is working...`
+                        : status === 'idle' ? `${agentName} session idle`
+                        : `${agentName} session finished`;
 
             const extTag = entry.querySelector('.oz-nav-file-tag, .nav-file-tag');
             if (extTag) {
@@ -1110,7 +1139,8 @@ class SessionPickerModal extends FuzzySuggestModal {
     constructor(app, plugin) {
         super(app);
         this.plugin = plugin;
-        this.setPlaceholder('Switch to a Claude session...');
+        const backendName = getBackendSettings(plugin.settings).displayName;
+        this.setPlaceholder(`Switch to a ${backendName} session...`);
     }
 
     getItems() {
@@ -1173,18 +1203,18 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
     display() {
         const { containerEl } = this;
         containerEl.empty();
-        containerEl.createEl('h2', { text: 'Claude Terminal' });
+        containerEl.createEl('h2', { text: 'AI Agent Terminal' });
 
         const desc = containerEl.createEl('p');
         desc.style.color = 'var(--text-muted)';
         desc.style.fontSize = '13px';
         desc.style.marginBottom = '16px';
-        desc.textContent = 'Right-sidebar Claude Code terminal that follows the currently viewed file. ' +
+        desc.textContent = 'Right-sidebar AI coding terminal that follows the currently viewed file. ' +
             'Each file gets its own persistent terminal session. Toggle with Ctrl+Shift+L.';
 
         new Setting(containerEl)
             .setName('Auto-open for supported files')
-            .setDesc('Automatically open the Claude Terminal sidebar when viewing a supported file type.')
+            .setDesc('Automatically open the AI Agent Terminal sidebar when viewing a supported file type.')
             .addToggle(toggle =>
                 toggle.setValue(this.plugin.settings.autoOpen)
                     .onChange(async (val) => {
@@ -1195,7 +1225,7 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Notify on session exit')
-            .setDesc('Show a notification when a Claude Code session process exits.')
+            .setDesc('Show a notification when an AI agent session process exits.')
             .addToggle(toggle =>
                 toggle.setValue(this.plugin.settings.notifyOnSessionDone)
                     .onChange(async (val) => {
@@ -1213,20 +1243,34 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
             .addDropdown(dropdown => dropdown
                 .addOption('claude', 'Claude Code')
                 .addOption('codex', 'Codex')
+                .addOption('custom', this.plugin.settings.customDisplayName || 'Custom CLI')
                 .setValue(this.plugin.settings.cliBackend)
                 .onChange(async (value) => {
+                    const oldBackend = getBackendSettings(this.plugin.settings).backend;
                     this.plugin.settings.cliBackend = value;
                     await this.plugin.saveSettings();
+                    if (value !== oldBackend) {
+                        const hadSessions = this.plugin.sessions.size > 0;
+                        this.plugin._closeAllSessions();
+                        await this.plugin._restartOpenTerminalForActiveFile();
+                        if (hadSessions) {
+                            const backendName = getBackendSettings(this.plugin.settings).displayName;
+                            new Notice(`Switched to ${backendName}. Existing sessions were closed so new terminals use the selected backend.`);
+                        }
+                    }
                     this.display(); // re-render to show/hide backend-specific settings
                 })
             );
 
-        const isCodex = this.plugin.settings.cliBackend === 'codex';
+        const { backend } = getBackendSettings(this.plugin.settings);
+        const isClaude = backend === 'claude';
+        const isCodex = backend === 'codex';
+        const isCustom = backend === 'custom';
 
-        if (!isCodex) {
+        if (isClaude) {
             new Setting(containerEl)
                 .setName('Claude binary path')
-                .setDesc('Path to the Claude Code binary. Leave empty to auto-detect (~/.local/bin/claude).')
+                .setDesc('Path to the Claude Code binary. Leave empty to auto-detect common locations.')
                 .addText(text => text
                     .setPlaceholder('~/.local/bin/claude')
                     .setValue(this.plugin.settings.claudeBinaryPath)
@@ -1240,12 +1284,88 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
         if (isCodex) {
             new Setting(containerEl)
                 .setName('Codex binary path')
-                .setDesc('Path to the Codex binary. Leave empty to auto-detect.')
+                .setDesc('Path to the Codex binary. Leave empty to auto-detect ~/.local/bin, Homebrew, /usr/local/bin, and nvm installs.')
                 .addText(text => text
                     .setPlaceholder('auto-detect')
                     .setValue(this.plugin.settings.codexBinaryPath)
                     .onChange(async (value) => {
                         this.plugin.settings.codexBinaryPath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+                );
+        }
+
+        if (isCustom) {
+            new Setting(containerEl)
+                .setName('Custom display name')
+                .setDesc('Name shown in notices, badges, and session labels for the Custom CLI backend.')
+                .addText(text => text
+                    .setPlaceholder('Custom CLI')
+                    .setValue(this.plugin.settings.customDisplayName)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customDisplayName = value.trim() || 'Custom CLI';
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName('Custom binary path')
+                .setDesc('Full path to the custom agent CLI binary.')
+                .addText(text => text
+                    .setPlaceholder('/path/to/agent')
+                    .setValue(this.plugin.settings.customBinaryPath)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customBinaryPath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName('Custom fixed arguments')
+                .setDesc('Arguments passed before the prompt. Supports normal shell-like quotes for paths and values with spaces.')
+                .addText(text => text
+                    .setPlaceholder('--flag \"value with spaces\"')
+                    .setValue(this.plugin.settings.customFixedArgs)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customFixedArgs = value;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName('Use current prompts for Custom CLI')
+                .setDesc('Copy the built-in generic and .tex prompt wording into the editable Custom CLI templates.')
+                .addButton(button => button
+                    .setButtonText('Copy prompts')
+                    .onClick(async () => {
+                        this.plugin.settings.customPromptTemplate = 'We are working on the file "{filePath}". Read it first, then help me with the following: ';
+                        this.plugin.settings.customTexPromptTemplate = 'We are working on "{filePath}". Read the AI-Router at _School-Hub/_ai-instructions/AI-Router.md first, then fix the following issues. After fixing, run the post-worksheet-chain (compile, deploy, visual-verify, update Serienplan). Here is what needs to be fixed: ';
+                        await this.plugin.saveSettings();
+                        new Notice('Copied current prompts into Custom CLI templates.');
+                        this.display();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName('Custom generic prompt template')
+                .setDesc('Used for non-.tex files. Supports {filePath}, {fileName}, {className}, and {agentName}. Empty uses the built-in prompt.')
+                .addTextArea(text => text
+                    .setPlaceholder('We are working on the file \"{filePath}\"...')
+                    .setValue(this.plugin.settings.customPromptTemplate)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customPromptTemplate = value;
+                        await this.plugin.saveSettings();
+                    })
+                );
+
+            new Setting(containerEl)
+                .setName('Custom .tex prompt template')
+                .setDesc('Used for .tex files. Supports {filePath}, {fileName}, {className}, and {agentName}. Empty uses the built-in prompt.')
+                .addTextArea(text => text
+                    .setPlaceholder('We are working on \"{filePath}\"...')
+                    .setValue(this.plugin.settings.customTexPromptTemplate)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customTexPromptTemplate = value;
                         await this.plugin.saveSettings();
                     })
                 );
@@ -1275,7 +1395,7 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
                 })
             );
 
-        if (!isCodex) {
+        if (isClaude) {
             new Setting(containerEl)
                 .setName('Skip permission prompts')
                 .setDesc('Pass --dangerously-skip-permissions to Claude Code.')

@@ -1,9 +1,9 @@
 {
   "id": "claude-terminal",
-  "name": "Claude Terminal",
+  "name": "AI Agent Terminal",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "Right-sidebar Claude Code terminal that follows the currently viewed file. Persistent sessions per file with status badges in the file tree.",
+  "description": "Right-sidebar AI agent terminal that follows the currently viewed file. Persistent sessions per file with status badges in the file tree.",
   "author": "Mario Wabnig",
   "authorUrl": "",
   "isDesktopOnly": true
