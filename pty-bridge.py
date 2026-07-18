@@ -11,10 +11,28 @@ fd 3   → resize channel: send "cols,rows\n" to resize the PTY
 import sys, os, struct, fcntl, termios, pty, signal, threading
 
 
+def parse_resize_line(line):
+    try:
+        cols_text, rows_text = line.decode().strip().split(',')
+        cols, rows = int(cols_text), int(rows_text)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return (cols, rows) if cols > 0 and rows > 0 else None
+
+
 def main():
     cmd = sys.argv[1:]
     if not cmd:
-        sys.exit(1)
+        return 1
+
+    # Detect the optional resize channel before opening the PTY. Otherwise the
+    # newly allocated master can itself become fd 3 and be mistaken for it,
+    # causing the resize thread to consume and discard all terminal output.
+    try:
+        os.fstat(3)
+        has_resize_channel = True
+    except OSError:
+        has_resize_channel = False
 
     master_fd, slave_fd = pty.openpty()
 
@@ -55,9 +73,7 @@ def main():
     threading.Thread(target=read_stdin, daemon=True).start()
 
     # Read fd 3 (resize channel) if the caller opened it
-    try:
-        os.fstat(3)
-
+    if has_resize_channel:
         def read_resize():
             buf = b''
             while True:
@@ -68,18 +84,13 @@ def main():
                     buf += data
                     while b'\n' in buf:
                         line, buf = buf.split(b'\n', 1)
-                        parts = line.decode().strip().split(',')
-                        if len(parts) == 2:
-                            try:
-                                handle_resize(int(parts[0]), int(parts[1]))
-                            except ValueError:
-                                pass  # ignore malformed resize data
+                        size = parse_resize_line(line)
+                        if size:
+                            handle_resize(*size)
                 except OSError:
                     break
 
         threading.Thread(target=read_resize, daemon=True).start()
-    except Exception:
-        pass
 
     # Forward master → stdout
     while True:
@@ -94,10 +105,11 @@ def main():
 
     # Wait for child to exit
     try:
-        os.waitpid(pid, 0)
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status)
     except Exception:
-        pass
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
