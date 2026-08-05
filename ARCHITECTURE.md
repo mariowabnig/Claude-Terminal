@@ -30,6 +30,7 @@ Claude-Terminal/
 ├── manifest.json        # Obsidian plugin manifest
 ├── data.json            # Persisted plugin settings (written by Obsidian)
 ├── sync-to-icloud.sh    # Deploy script: copies plugin folder to iCloud vault
+├── tests/               # Node helper regressions and Python PTY integration tests
 ├── styles.css           # Legacy/unused stylesheet
 └── docs-internal/
     └── done/
@@ -103,6 +104,7 @@ ClaudeTerminalView.switchSession()
 - **Context-aware initial prompt.** `.tex` files get a school-specific prompt (reads AI-Router, runs post-worksheet-chain). All other files get a generic "read the file first" prompt.
 - **File-tree badges.** A `MutationObserver` watches `.nav-files-container` (standard) and `.oz-file-tree-files` (Oz File Tree plugin). Badges are re-injected on every DOM change.
 - **Auto-close timer.** Sessions with no user interaction are killed after `idleSessionTimeout` seconds (default 60 s) when the user navigates away.
+- **Centralized session disposal.** Auto-close, backend changes, and plugin unload clear all timers, terminate the PTY process, dispose xterm, and suppress intentional exit notifications.
 - **xterm loading.** Tries `window.require` (Electron cache) first, falls back to reading the file and evaluating as UMD via `new Function`.
 
 ---

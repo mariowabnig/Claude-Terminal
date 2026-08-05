@@ -45,6 +45,17 @@ function expandHome(filePath, homeDir) {
     return filePath.startsWith('~/') ? path.join(homeDir, filePath.slice(2)) : filePath;
 }
 
+function parseNonNegativeInteger(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+}
+
+function buildSpawnPath(currentPath, extraPaths) {
+    const existing = (currentPath || '').split(path.delimiter).filter(Boolean);
+    const availableExtras = extraPaths.filter(p => p && fs.existsSync(p));
+    return [...new Set([...availableExtras, ...existing])].join(path.delimiter);
+}
+
 function splitShellArgs(input) {
     const args = [];
     let current = '';
@@ -152,7 +163,9 @@ function getNvmCodexCandidates(homeDir, env) {
             for (const version of versions) {
                 candidates.push(path.join(versionsDir, version, 'bin', 'codex'));
             }
-        } catch(e) {}
+        } catch(e) {
+            console.warn(`AI Agent Terminal: could not inspect ${versionsDir}`, e);
+        }
     }
 
     return candidates;
@@ -232,6 +245,11 @@ class ClaudeTerminalView extends ItemView {
 
         // Load xterm.js dynamically from the plugin folder
         await this._loadXterm();
+        if (!this._xtermLoaded) {
+            this.headerLabel.textContent = 'Terminal failed to load';
+            new Notice('AI Agent Terminal could not load xterm.js. Check the developer console.');
+            return;
+        }
 
         // If there's a currently active file, switch to it
         const activeFile = this.plugin.app.workspace.getActiveFile();
@@ -373,7 +391,7 @@ class ClaudeTerminalView extends ItemView {
 
             setTimeout(() => {
                 if (this.fitAddon) {
-                    try { this.fitAddon.fit(); } catch(e) {}
+                    try { this.fitAddon.fit(); } catch(e) { console.warn('AI Agent Terminal: fit failed on reattach', e); }
                 }
             }, 50);
         } else {
@@ -405,7 +423,7 @@ class ClaudeTerminalView extends ItemView {
             terminal.open(termDiv);
 
             setTimeout(() => {
-                try { fitAddon.fit(); } catch(e) {}
+                try { fitAddon.fit(); } catch(e) { console.warn('AI Agent Terminal: initial fit failed', e); }
             }, 50);
 
             this.terminal = terminal;
@@ -420,7 +438,7 @@ class ClaudeTerminalView extends ItemView {
                 if (session.process && !session.process.killed) {
                     session.userInteracted = true;
                     clearTimeout(session._autoCloseTimer);
-                    try { session.process.stdin.write(data); } catch(e) {}
+                    try { session.process.stdin.write(data); } catch(e) { console.warn('AI Agent Terminal: stdin write failed', e); }
                 }
             });
 
@@ -438,10 +456,10 @@ class ClaudeTerminalView extends ItemView {
                         if (dims) {
                             try {
                                 session.resizePipe.write(`${dims.cols},${dims.rows}\n`);
-                            } catch(e) {}
+                            } catch(e) { console.warn('AI Agent Terminal: resize pipe write failed', e); }
                         }
                     }
-                } catch(e) {}
+                } catch(e) { console.warn('AI Agent Terminal: fit on resize failed', e); }
             }
         });
         this.resizeObserver.observe(this.terminalEl);
@@ -474,7 +492,7 @@ class ClaudeTerminalView extends ItemView {
         }
 
         // Resolve Python3 path
-        let pythonPath = settings.pythonPath || null;
+        let pythonPath = expandHome(settings.pythonPath, homeDir) || null;
         if (!pythonPath) {
             for (const p of ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']) {
                 if (fs.existsSync(p)) { pythonPath = p; break; }
@@ -511,14 +529,10 @@ class ClaudeTerminalView extends ItemView {
         }
         if (settings.extraPathDirs) {
             for (const d of settings.extraPathDirs.split(',').map(s => s.trim()).filter(Boolean)) {
-                extraPaths.push(d);
+                extraPaths.push(expandHome(d, homeDir));
             }
         }
-        const currentPath = spawnEnv.PATH || '';
-        const missingPaths = extraPaths.filter(p => !currentPath.includes(p) && fs.existsSync(p));
-        if (missingPaths.length > 0) {
-            spawnEnv.PATH = missingPaths.join(':') + ':' + currentPath;
-        }
+        spawnEnv.PATH = buildSpawnPath(spawnEnv.PATH, extraPaths);
 
         const vaultRoot = this.plugin.app.vault.adapter.basePath;
         const cliArgs = [cliBinaryPath, ...command.fixedArgs];
@@ -551,6 +565,12 @@ class ClaudeTerminalView extends ItemView {
             console.error('AI Agent Terminal: process error', err);
             new Notice(`${cliName} process error: ${err.message}`);
             session.exited = true;
+            session.processError = true;
+            session.isWorking = false;
+            clearTimeout(session._idleTimer);
+            clearTimeout(session._readyTimer);
+            this._updateStatusDot(session);
+            this.plugin._updateFileTreeBadges();
         });
 
         // Wire PTY output to terminal — registered once, safe across reattach
@@ -582,8 +602,11 @@ class ClaudeTerminalView extends ItemView {
             session.isWorking = false;
             session.exited = true;
             clearTimeout(session._idleTimer);
+            clearTimeout(session._readyTimer);
             this._updateStatusDot(session);
-            if (this.plugin.settings.notifyOnSessionDone) {
+            if (this.plugin.settings.notifyOnSessionDone
+                && !session.suppressExitNotice
+                && !session.processError) {
                 const status = code === 0 ? 'completed' : `exited (code ${code})`;
                 new Notice(`${cliName} session ${status}: ${path.basename(fileKey)}`, 5000);
             }
@@ -599,7 +622,7 @@ class ClaudeTerminalView extends ItemView {
             session.initialPromptSent = true;
             try {
                 proc.stdin.write(initialPrompt);
-            } catch(e) {}
+            } catch(e) { console.warn('AI Agent Terminal: initial prompt write failed', e); }
             // Auto-focus terminal after initial prompt so cursor is ready
             setTimeout(() => {
                 if (session.terminal) session.terminal.focus();
@@ -610,13 +633,14 @@ class ClaudeTerminalView extends ItemView {
             outputBuf += data.toString();
             if (outputBuf.includes('>') || outputBuf.includes('\u276f') || outputBuf.includes('Claude') || outputBuf.includes('Codex') || outputBuf.includes('codex') || outputBuf.includes(cliName)) {
                 proc.stdout.removeListener('data', readyListener);
-                setTimeout(sendInitialPrompt, 500);
+                clearTimeout(session._readyTimer);
+                session._readyTimer = setTimeout(sendInitialPrompt, 500);
             }
         };
         proc.stdout.on('data', readyListener);
 
         // Fallback: send after 10 seconds
-        setTimeout(() => {
+        session._readyTimer = setTimeout(() => {
             proc.stdout.removeListener('data', readyListener);
             sendInitialPrompt();
         }, 10000);
@@ -665,6 +689,7 @@ class ClaudeTerminalPlugin extends Plugin {
         super(...arguments);
         this.sessions = new Map();       // fileKey -> session object
         this._currentFileKey = null;     // currently tracked file
+        this._openingFileKey = null;     // prevents duplicate auto-open races
     }
 
     async onload() {
@@ -764,6 +789,10 @@ class ClaudeTerminalPlugin extends Plugin {
                 }
                 .claude-term-badge.is-idle {
                     color: var(--text-muted, #888);
+                }
+                .claude-term-badge.is-active,
+                .claude-term-badge.is-paused {
+                    color: var(--text-warning, #e6a700);
                 }
                 .claude-term-badge.is-done {
                     color: var(--text-success, #4caf50);
@@ -897,20 +926,7 @@ class ClaudeTerminalPlugin extends Plugin {
 
         // Kill all sessions — each wrapped individually to prevent cascading failures
         for (const session of this.sessions.values()) {
-            try {
-                if (session.process && !session.process.killed) {
-                    session.process.kill('SIGTERM');
-                }
-            } catch (e) {
-                console.warn('AI Agent Terminal: failed to kill process', e);
-            }
-            try {
-                if (session.terminal) {
-                    session.terminal.dispose();
-                }
-            } catch (e) {
-                console.warn('AI Agent Terminal: failed to dispose terminal', e);
-            }
+            this._disposeSession(session);
         }
         this.sessions.clear();
 
@@ -930,19 +946,28 @@ class ClaudeTerminalPlugin extends Plugin {
 
     _onFileFocused(file) {
         const fileKey = file.path;
+        const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
 
-        if (fileKey === this._currentFileKey) return;
+        if (fileKey === this._currentFileKey
+            && (termLeaves.length > 0 || this._openingFileKey === fileKey)) return;
         this._currentFileKey = fileKey;
 
-        // Only auto-switch if the sidebar is already open (or autoOpen is enabled)
-        const termLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        if (termLeaves.length === 0 && !this.settings.autoOpen) return;
-        if (termLeaves.length > 0) {
-            const view = termLeaves[0].view;
-            if (view instanceof ClaudeTerminalView) {
-                const absPath = path.join(this.app.vault.adapter.basePath, fileKey);
-                view.switchSession(fileKey, absPath, file);
+        // Switch an existing sidebar, or create it when auto-open is enabled.
+        if (termLeaves.length === 0) {
+            if (this.settings.autoOpen) {
+                this._openingFileKey = fileKey;
+                void this._openTerminalForFile(file)
+                    .catch((e) => console.error(`AI Agent Terminal: failed to open ${fileKey}`, e))
+                    .finally(() => {
+                        if (this._openingFileKey === fileKey) this._openingFileKey = null;
+                    });
             }
+            return;
+        }
+        const view = termLeaves[0].view;
+        if (view instanceof ClaudeTerminalView) {
+            const absPath = path.join(this.app.vault.adapter.basePath, fileKey);
+            void view.switchSession(fileKey, absPath, file);
         }
     }
 
@@ -1013,18 +1038,33 @@ class ClaudeTerminalPlugin extends Plugin {
     // Auto-close unused sessions (no user interaction after 60s)
     // -----------------------------------------------------------------------
 
+    _disposeSession(session) {
+        session.suppressExitNotice = true;
+        clearTimeout(session._autoCloseTimer);
+        clearTimeout(session._idleTimer);
+        clearTimeout(session._readyTimer);
+        try {
+            if (session.process && !session.process.killed) {
+                session.process.kill('SIGTERM');
+            }
+        } catch (e) {
+            console.warn('AI Agent Terminal: failed to kill process', e);
+        }
+        try {
+            session.terminal?.dispose();
+        } catch (e) {
+            console.warn('AI Agent Terminal: failed to dispose terminal', e);
+        }
+        session.terminal = null;
+        session.terminalEl = null;
+        session.fitAddon = null;
+    }
+
     _autoCloseSession(session) {
         if (session.userInteracted || session.exited) return;
         console.log(`AI Agent Terminal: auto-closing unused session for "${session.key}"`);
 
-        // Kill the process
-        if (session.process && !session.process.killed) {
-            session.process.kill('SIGTERM');
-        }
-        // Dispose terminal
-        if (session.terminal) {
-            session.terminal.dispose();
-        }
+        this._disposeSession(session);
         // Remove from sessions map
         this.sessions.delete(session.key);
         this._updateFileTreeBadges();
@@ -1032,18 +1072,7 @@ class ClaudeTerminalPlugin extends Plugin {
 
     _closeAllSessions() {
         for (const session of this.sessions.values()) {
-            clearTimeout(session._autoCloseTimer);
-            clearTimeout(session._idleTimer);
-            try {
-                if (session.process && !session.process.killed) {
-                    session.process.kill('SIGTERM');
-                }
-            } catch(e) {}
-            try {
-                if (session.terminal) {
-                    session.terminal.dispose();
-                }
-            } catch(e) {}
+            this._disposeSession(session);
         }
         this.sessions.clear();
         this._updateFileTreeBadges();
@@ -1073,7 +1102,10 @@ class ClaudeTerminalPlugin extends Plugin {
     _getSessionFilePaths() {
         const map = new Map();
         for (const [fileKey, session] of this.sessions) {
-            map.set(fileKey, getSessionStatus(session));
+            map.set(fileKey, {
+                status: getSessionStatus(session),
+                displayName: session.displayName || 'AI agent',
+            });
         }
         return map;
     }
@@ -1095,21 +1127,24 @@ class ClaudeTerminalPlugin extends Plugin {
             const dataPath = entry.getAttribute('data-path');
             if (!dataPath) continue;
 
-            const status = sessionFiles.get(dataPath);
-            if (!status) continue;
+            const sessionInfo = sessionFiles.get(dataPath);
+            if (!sessionInfo) continue;
+            const { status, displayName } = sessionInfo;
 
             if (entry.querySelector('.claude-term-badge')) continue;
 
             const badge = document.createElement('span');
             const badgeCls = status === 'working' ? 'is-working'
                            : status === 'idle' ? 'is-idle'
-                           : 'is-done';
+                           : status === 'done' ? 'is-done'
+                           : status === 'active' ? 'is-active'
+                           : 'is-paused';
             badge.className = `claude-term-badge ${badgeCls}`;
             badge.textContent = status === 'done' ? '\u2713' : '\u25cf';
-            const agentName = session.displayName || 'AI agent';
-            badge.title = status === 'working' ? `${agentName} is working...`
-                        : status === 'idle' ? `${agentName} session idle`
-                        : `${agentName} session finished`;
+            badge.title = status === 'working' ? `${displayName} is working...`
+                        : status === 'idle' ? `${displayName} session idle`
+                        : status === 'done' ? `${displayName} session finished`
+                        : `${displayName} session waiting for input`;
 
             const extTag = entry.querySelector('.oz-nav-file-tag, .nav-file-tag');
             if (extTag) {
@@ -1156,6 +1191,7 @@ class SessionPickerModal extends FuzzySuggestModal {
     getItemText(item) {
         const icon = item.status === 'working' ? '\u25cf Working'
                    : item.status === 'active' ? '\u25cf Active'
+                   : item.status === 'paused' ? '\u25cf Paused'
                    : item.status === 'idle' ? '\u25cb Idle'
                    : '\u2713 Done';
         return `${path.basename(item.fileKey)}  [${icon}]  ${item.fileKey}`;
@@ -1442,7 +1478,7 @@ class ClaudeTerminalSettingTab extends PluginSettingTab {
                 .setPlaceholder('60')
                 .setValue(String(this.plugin.settings.idleSessionTimeout))
                 .onChange(async (value) => {
-                    this.plugin.settings.idleSessionTimeout = Math.max(0, parseInt(value) || 60);
+                    this.plugin.settings.idleSessionTimeout = parseNonNegativeInteger(value, 60);
                     await this.plugin.saveSettings();
                 })
             );

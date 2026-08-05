@@ -98,6 +98,17 @@ Both can run simultaneously without conflict. They use separate session maps and
 
 ## Changelog
 
+### 2026-08-05 - Reliability and lifecycle hardening
+
+- Fixed file-tree badge crashes and preserved distinct active, paused, and completed states.
+- Auto-open now creates the sidebar, avoids duplicate open races, and can reopen it for the same focused file after the sidebar was closed.
+- Failed xterm loads stop before session creation and display a clear error state.
+- Session disposal now clears every timer and terminal reference and suppresses notifications for intentional shutdowns.
+- Python and extra PATH settings expand `~/`; PATH entries are deduplicated exactly and use the platform delimiter.
+- A zero idle timeout is preserved instead of silently becoming 60 seconds.
+- The PTY bridge retries partial writes and forwards termination signals to the child process group.
+- Added Node helper regression tests and expanded the Python PTY suite.
+
 ### 2026-05-15 - AI Agent Terminal rebrand and Custom CLI backend
 
 - Rebranded visible plugin UI, commands, notices, settings, manifest, and docs to AI Agent Terminal while keeping the `claude-terminal` id and folder.

@@ -1,8 +1,10 @@
 import importlib.util
 import pathlib
+import signal
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -21,6 +23,21 @@ class ResizeParsingTests(unittest.TestCase):
         for value in (b"", b"wide,tall", b"80", b"0,24", b"80,-1", b"\xff,24"):
             with self.subTest(value=value):
                 self.assertIsNone(PTY_BRIDGE.parse_resize_line(value))
+
+
+class WriteTests(unittest.TestCase):
+    def test_write_all_retries_partial_writes(self):
+        written_chunks = []
+
+        def partial_write(_fd, data):
+            chunk = bytes(data[:2])
+            written_chunks.append(chunk)
+            return len(chunk)
+
+        with mock.patch.object(PTY_BRIDGE.os, "write", side_effect=partial_write):
+            PTY_BRIDGE.write_all(1, b"abcdef")
+
+        self.assertEqual(b"".join(written_chunks), b"abcdef")
 
 
 class BridgeProcessTests(unittest.TestCase):
@@ -42,6 +59,29 @@ class BridgeProcessTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 7)
+
+    def test_forwards_termination_to_child_process_group(self):
+        child_code = (
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(23))\n"
+            "print('ready', flush=True)\n"
+            "while True: time.sleep(1)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, str(BRIDGE_PATH), sys.executable, "-c", child_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertIn(b"ready", proc.stdout.readline())
+            proc.send_signal(signal.SIGTERM)
+            proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 23)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
 
 
 if __name__ == "__main__":

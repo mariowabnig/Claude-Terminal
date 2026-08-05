@@ -16,7 +16,10 @@ This repository is prepared for both Codex and Claude Code. Keep durable project
 - Do not edit `CLAUDE.md` unless the user explicitly asks to migrate or update Claude guidance.
 
 ### Common Commands
-- Use the existing README and project files to identify the smallest relevant build or test command.
+- `node --check main.js` — syntax-check the direct JavaScript entry point.
+- `node tests/test_main_helpers.js` — test pure helpers and lifecycle regression guards.
+- `python3 -m unittest discover -s tests -v` — test PTY forwarding, resizing, partial writes, and signal handling.
+- `bash -n sync-to-icloud.sh` — syntax-check the development sync script.
 
 ### Working Rules
 - Keep changes small, reviewable, and tied to the requested behavior.

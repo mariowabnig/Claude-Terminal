@@ -8,7 +8,14 @@ stdin  → master fd (forwarded to child)
 stdout ← master fd (child output)
 fd 3   → resize channel: send "cols,rows\n" to resize the PTY
 """
-import sys, os, struct, fcntl, termios, pty, signal, threading
+import fcntl
+import os
+import pty
+import signal
+import struct
+import sys
+import termios
+import threading
 
 
 def parse_resize_line(line):
@@ -18,6 +25,27 @@ def parse_resize_line(line):
     except (UnicodeDecodeError, ValueError):
         return None
     return (cols, rows) if cols > 0 and rows > 0 else None
+
+
+def write_all(fd, data):
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("write returned no progress")
+        remaining = remaining[written:]
+
+
+def forward_signal(pid, signum):
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
 
 
 def main():
@@ -51,6 +79,9 @@ def main():
     # Parent
     os.close(slave_fd)
 
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, lambda received, _frame, child_pid=pid: forward_signal(child_pid, received))
+
     def handle_resize(cols, rows):
         try:
             s = struct.pack('HHHH', rows, cols, 0, 0)
@@ -66,7 +97,7 @@ def main():
                 data = os.read(0, 4096)
                 if not data:
                     break
-                os.write(master_fd, data)
+                write_all(master_fd, data)
             except OSError:
                 break
 
@@ -98,8 +129,7 @@ def main():
             data = os.read(master_fd, 4096)
             if not data:
                 break
-            os.write(1, data)
-            sys.stdout.flush()
+            write_all(1, data)
         except OSError:
             break
 
