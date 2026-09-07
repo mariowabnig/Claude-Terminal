@@ -98,6 +98,11 @@ Both can run simultaneously without conflict. They use separate session maps and
 
 ## Changelog
 
+### 2026-09-07 — Guard session creation after terminal loading failure
+
+- `switchSession` now requires a loaded terminal UI, including calls from external file-opening paths.
+- Added `node tests/test_session_loading.js` to verify failed loading cannot start a process and successful loading still creates a session.
+
 ### 2026-08-05 - Reliability and lifecycle hardening
 
 - Fixed file-tree badge crashes and preserved distinct active, paused, and completed states.

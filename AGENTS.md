@@ -16,6 +16,7 @@ This repository is prepared for both Codex and Claude Code. Keep durable project
 - Do not edit `CLAUDE.md` unless the user explicitly asks to migrate or update Claude guidance.
 
 ### Common Commands
+- `node tests/test_session_loading.js` — test session creation after failed and successful UI loading.
 - `node --check main.js` — syntax-check the direct JavaScript entry point.
 - `node tests/test_main_helpers.js` — test pure helpers and lifecycle regression guards.
 - `python3 -m unittest discover -s tests -v` — test PTY forwarding, resizing, partial writes, and signal handling.

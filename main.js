@@ -322,6 +322,7 @@ class ClaudeTerminalView extends ItemView {
      * Creates a new session if one doesn't exist.
      */
     async switchSession(fileKey, absPath, file) {
+        if (!this._xtermLoaded) return;
         if (fileKey === this.currentFileKey && this.terminal) {
             return; // already showing
         }
